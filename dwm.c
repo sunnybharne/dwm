@@ -35,12 +35,14 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
+#include <X11/Xresource.h>
 #include <X11/Xutil.h>
+#include <X11/XF86keysym.h>
 #ifdef XINERAMA
 #include <X11/extensions/Xinerama.h>
 #endif /* XINERAMA */
 #include <X11/Xft/Xft.h>
-
+#include <time.h>
 #include "drw.h"
 #include "util.h"
 
@@ -55,13 +57,26 @@
 #define HEIGHT(X)               ((X)->h + 2 * (X)->bw)
 #define TAGMASK                 ((1 << LENGTH(tags)) - 1)
 #define TEXTW(X)                (drw_fontset_getwidth(drw, (X)) + lrpad)
+#define XRDB_LOAD_COLOR(R,V)    if (XrmGetResource(xrdb, R, NULL, &type, &value) == True) { \
+                                if (value.addr != NULL && strnlen(value.addr, 8) == 7 && value.addr[0] == '#') { \
+                                  int i = 1; \
+                                  for (; i <= 6; i++) { \
+                                    if (value.addr[i] < 48) break; \
+                                    if (value.addr[i] > 57 && value.addr[i] < 65) break; \
+                                    if (value.addr[i] > 70 && value.addr[i] < 97) break; \
+                                    if (value.addr[i] > 102) break; \
+                                  } \
+                                  if (i == 7) { \
+                                    strncpy(V, value.addr, 7); \
+                                    V[7] = '\0'; \
+                                  } \
+                                } \
+                              }
 
 /* enums */
 enum { CurNormal, CurResize, CurMove, CurLast }; /* cursor */
 enum { SchemeNorm, SchemeSel }; /* color schemes */
-enum { NetSupported, NetWMName, NetWMState, NetWMCheck,
-       NetWMFullscreen, NetActiveWindow, NetWMWindowType,
-       NetWMWindowTypeDialog, NetClientList, NetLast }; /* EWMH atoms */
+enum { NetSupported, NetWMName, NetWMState, NetWMCheck, NetWMFullscreen, NetActiveWindow, NetWMWindowType, NetWMWindowTypeDialog, NetClientList,NetWMWindowsOpacity, NetLast }; /* EWMH atoms */
 enum { WMProtocols, WMDelete, WMState, WMTakeFocus, WMLast }; /* default atoms */
 enum { ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle,
        ClkClientWin, ClkRootWin, ClkLast }; /* clicks */
@@ -106,6 +121,11 @@ typedef struct {
 } Key;
 
 typedef struct {
+	unsigned int mod;
+	KeySym keysym;
+} KeyBinding;
+
+typedef struct {
 	const char *symbol;
 	void (*arrange)(Monitor *);
 } Layout;
@@ -118,6 +138,7 @@ struct Monitor {
 	int by;               /* bar geometry */
 	int mx, my, mw, mh;   /* screen size */
 	int wx, wy, ww, wh;   /* window area  */
+	int gappx;            /* gaps between windows */
 	unsigned int seltags;
 	unsigned int sellt;
 	unsigned int tagset[2];
@@ -164,6 +185,7 @@ static void drawbar(Monitor *m);
 static void drawbars(void);
 static void enternotify(XEvent *e);
 static void expose(XEvent *e);
+static void opacity(Client *c, double opacity);
 static void focus(Client *c);
 static void focusin(XEvent *e);
 static void focusmon(const Arg *arg);
@@ -177,6 +199,7 @@ static void grabkeys(void);
 static void incnmaster(const Arg *arg);
 static void keypress(XEvent *e);
 static void killclient(const Arg *arg);
+static void loadxrdb(void);
 static void manage(Window w, XWindowAttributes *wa);
 static void mappingnotify(XEvent *e);
 static void maprequest(XEvent *e);
@@ -195,10 +218,12 @@ static void restack(Monitor *m);
 static void run(void);
 static void scan(void);
 static int sendevent(Client *c, Atom proto);
+static void sendkeyevent(const Arg *arg);
 static void sendmon(Client *c, Monitor *m);
 static void setclientstate(Client *c, long state);
 static void setfocus(Client *c);
 static void setfullscreen(Client *c, int fullscreen);
+static void setgaps(const Arg *arg);
 static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
@@ -231,6 +256,7 @@ static Monitor *wintomon(Window w);
 static int xerror(Display *dpy, XErrorEvent *ee);
 static int xerrordummy(Display *dpy, XErrorEvent *ee);
 static int xerrorstart(Display *dpy, XErrorEvent *ee);
+static void xrdb(const Arg *arg);
 static void zoom(const Arg *arg);
 
 /* variables */
@@ -266,12 +292,25 @@ static Display *dpy;
 static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
+static int restart = 0;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
+
+void
+opacity(Client *c, double opacity)
+{
+	if(opacity >= 0 && opacity <= 1) {
+		unsigned long real_opacity[] = { opacity * 0xffffffff };
+		XChangeProperty(dpy, c->win, netatom[NetWMWindowsOpacity], XA_CARDINAL,
+				32, PropModeReplace, (unsigned char *)real_opacity,
+				1);
+	} else
+		XDeleteProperty(dpy, c->win, netatom[NetWMWindowsOpacity]);
+}
 
 /* function implementations */
 void
@@ -640,6 +679,7 @@ createmon(void)
 	m->nmaster = nmaster;
 	m->showbar = showbar;
 	m->topbar = topbar;
+ 	m->gappx = gappx;
 	m->lt[0] = &layouts[0];
 	m->lt[1] = &layouts[1 % LENGTH(layouts)];
 	strncpy(m->ltsymbol, layouts[0].symbol, sizeof m->ltsymbol);
@@ -787,6 +827,7 @@ expose(XEvent *e)
 	if (ev->count == 0 && (m = wintomon(ev->window)))
 		drawbar(m);
 }
+
 
 void
 focus(Client *c)
@@ -1031,6 +1072,37 @@ killclient(const Arg *arg)
 }
 
 void
+loadxrdb()
+{
+  Display *display;
+  char * resm;
+  XrmDatabase xrdb;
+  char *type;
+  XrmValue value;
+
+  display = XOpenDisplay(NULL);
+
+  if (display != NULL) {
+    resm = XResourceManagerString(display);
+
+    if (resm != NULL) {
+      xrdb = XrmGetStringDatabase(resm);
+
+      if (xrdb != NULL) {
+        XRDB_LOAD_COLOR("dwm.normbordercolor", normbordercolor);
+        XRDB_LOAD_COLOR("dwm.normbgcolor", normbgcolor);
+        XRDB_LOAD_COLOR("dwm.normfgcolor", normfgcolor);
+        XRDB_LOAD_COLOR("dwm.selbordercolor", selbordercolor);
+        XRDB_LOAD_COLOR("dwm.selbgcolor", selbgcolor);
+        XRDB_LOAD_COLOR("dwm.selfgcolor", selfgcolor);
+      }
+    }
+  }
+
+  XCloseDisplay(display);
+}
+
+void
 manage(Window w, XWindowAttributes *wa)
 {
 	Client *c, *t = NULL;
@@ -1047,6 +1119,7 @@ manage(Window w, XWindowAttributes *wa)
 	c->oldbw = wa->border_width;
 
 	updatetitle(c);
+  opacity(c, defaultopacity);
 	if (XGetTransientForHint(dpy, w, &trans) && (t = wintoclient(trans))) {
 		c->mon = t->mon;
 		c->tags = t->tags;
@@ -1258,9 +1331,85 @@ propertynotify(XEvent *e)
 }
 
 void
+saveSession(void)
+{
+	FILE *fw = fopen(SESSION_FILE, "w");
+	for (Client *c = selmon->clients; c != NULL; c = c->next) { // get all the clients with their tags and write them to the file
+		fprintf(fw, "%lu %u\n", c->win, c->tags);
+	}
+	fclose(fw);
+}
+
+void
+restoreSession(void)
+{
+	// restore session
+	FILE *fr = fopen(SESSION_FILE, "r");
+	if (!fr)
+		return;
+
+	char *str = malloc(23 * sizeof(char)); // allocate enough space for excepted input from text file
+	while (fscanf(fr, "%[^\n] ", str) != EOF) { // read file till the end
+		long unsigned int winId;
+		unsigned int tagsForWin;
+		int check = sscanf(str, "%lu %u", &winId, &tagsForWin); // get data
+		if (check != 2) // break loop if data wasn't read correctly
+			break;
+		
+		for (Client *c = selmon->clients; c ; c = c->next) { // add tags to every window by winId
+			if (c->win == winId) {
+				c->tags = tagsForWin;
+				break;
+			}
+		}
+    }
+
+	for (Client *c = selmon->clients; c ; c = c->next) { // refocus on windows
+		focus(c);
+		restack(c->mon);
+	}
+
+	for (Monitor *m = selmon; m; m = m->next) // rearrange all monitors
+		arrange(m);
+
+	free(str);
+	fclose(fr);
+	
+	// delete a file
+	remove(SESSION_FILE);
+}
+
+void
 quit(const Arg *arg)
 {
-	running = 0;
+	// running = 0;
+ 	FILE *fd = NULL;
+	struct stat filestat;
+
+	if ((fd = fopen(lockfile, "r")) && stat(lockfile, &filestat) == 0) {
+		fclose(fd);
+
+		if (filestat.st_ctime <= time(NULL)-2)
+			remove(lockfile);
+	}
+
+	if ((fd = fopen(lockfile, "r")) != NULL) {
+		fclose(fd);
+		remove(lockfile);
+		running = 0;
+	} else {
+		if ((fd = fopen(lockfile, "a")) != NULL)
+			fclose(fd);
+	}
+
+  if (arg->i) {
+       restart = 1;
+  }
+
+  running = 0;
+  
+  if (restart == 1)
+  saveSession();
 }
 
 Monitor *
@@ -1469,6 +1618,48 @@ sendevent(Client *c, Atom proto)
 	return exists;
 }
 
+XKeyEvent
+createkeyevent(Display *display, Window win, Window rootWindow, int type, KeyBinding *keyBinding)
+{
+	int keysym = keyBinding->keysym;
+	unsigned int modifier = keyBinding->mod;
+
+	XKeyEvent event;
+	event.type = type;
+	event.display = display;
+	event.window = win;
+	event.root = rootWindow;
+	event.subwindow = None;
+	event.time = CurrentTime;
+	event.x = 1;
+	event.y = 1;
+	event.x_root = 1;
+	event.y_root = 1;
+	event.same_screen = True;
+	event.keycode = XKeysymToKeycode(display, keysym);
+	event.state = modifier;
+
+	return event;
+}
+
+void sendkeyevent(const Arg *arg)
+{
+	Window rootWindow = XDefaultRootWindow(dpy);
+
+	Window focusedWindow;
+	int revert;
+	XGetInputFocus(dpy, &focusedWindow, &revert);
+
+	KeyBinding *keyBinding = (KeyBinding *)arg->v;
+
+	XKeyEvent event = createkeyevent(dpy, focusedWindow, rootWindow, KeyPress, keyBinding);
+	XSendEvent(event.display, event.window, True, KeyPressMask, (XEvent *)&event);
+
+	event = createkeyevent(dpy, focusedWindow, rootWindow, KeyRelease, keyBinding);
+	XSendEvent(event.display, event.window, True, KeyReleaseMask, (XEvent *)&event);
+}
+
+
 void
 setfocus(Client *c)
 {
@@ -1507,6 +1698,16 @@ setfullscreen(Client *c, int fullscreen)
 		resizeclient(c, c->x, c->y, c->w, c->h);
 		arrange(c->mon);
 	}
+}
+
+void
+setgaps(const Arg *arg)
+{
+	if ((arg->i == 0) || (selmon->gappx + arg->i < 0))
+		selmon->gappx = 0;
+	else
+		selmon->gappx += arg->i;
+	arrange(selmon);
 }
 
 void
@@ -1577,7 +1778,8 @@ setup(void)
 	netatom[NetWMName] = XInternAtom(dpy, "_NET_WM_NAME", False);
 	netatom[NetWMState] = XInternAtom(dpy, "_NET_WM_STATE", False);
 	netatom[NetWMCheck] = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
-	netatom[NetWMFullscreen] = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+	netatom[NetWMFullscreen] = XInternAtom(dpy, "_NET_WM_STATE_FUsLLSCREEN", False);
+  netatom[NetWMWindowsOpacity] = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
 	netatom[NetWMWindowType] = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
 	netatom[NetWMWindowTypeDialog] = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
 	netatom[NetClientList] = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
@@ -1699,18 +1901,29 @@ tile(Monitor *m)
 	if (n > m->nmaster)
 		mw = m->nmaster ? m->ww * m->mfact : 0;
 	else
-		mw = m->ww;
-	for (i = my = ty = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
-		if (i < m->nmaster) {
-			h = (m->wh - my) / (MIN(n, m->nmaster) - i);
-			resize(c, m->wx, m->wy + my, mw - (2*c->bw), h - (2*c->bw), 0);
-			if (my + HEIGHT(c) < m->wh)
-				my += HEIGHT(c);
+	// 	mw = m->ww;
+	// for (i = my = ty = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+	// 	if (i < m->nmaster) {
+	// 		h = (m->wh - my) / (MIN(n, m->nmaster) - i);
+	// 		resize(c, m->wx, m->wy + my, mw - (2*c->bw), h - (2*c->bw), 0);
+	// 		if (my + HEIGHT(c) < m->wh)
+	// 			my += HEIGHT(c);
+  	mw = m->ww - m->gappx;
+	for (i = 0, my = ty = m->gappx, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+			if (i < m->nmaster) {
+			h = (m->wh - my) / (MIN(n, m->nmaster) - i) - m->gappx;
+			resize(c, m->wx + m->gappx, m->wy + my, mw - (2*c->bw) - m->gappx, h - (2*c->bw), 0);
+			if (my + HEIGHT(c) + m->gappx < m->wh)
+				my += HEIGHT(c) + m->gappx;
 		} else {
-			h = (m->wh - ty) / (n - i);
-			resize(c, m->wx + mw, m->wy + ty, m->ww - mw - (2*c->bw), h - (2*c->bw), 0);
-			if (ty + HEIGHT(c) < m->wh)
-				ty += HEIGHT(c);
+			// h = (m->wh - ty) / (n - i);
+			// resize(c, m->wx + mw, m->wy + ty, m->ww - mw - (2*c->bw), h - (2*c->bw), 0);
+			// if (ty + HEIGHT(c) < m->wh)
+			// 	ty += HEIGHT(c);
+     	h = (m->wh - ty) / (n - i) - m->gappx;
+			resize(c, m->wx + mw + m->gappx, m->wy + ty, m->ww - mw - (2*c->bw) - 2*m->gappx, h - (2*c->bw), 0);
+			if (ty + HEIGHT(c) + m->gappx < m->wh)
+				ty += HEIGHT(c) + m->gappx;
 		}
 }
 
@@ -2131,6 +2344,17 @@ xerrorstart(Display *dpy, XErrorEvent *ee)
 }
 
 void
+xrdb(const Arg *arg)
+{
+  loadxrdb();
+  int i;
+  for (i = 0; i < LENGTH(colors); i++)
+                scheme[i] = drw_scm_create(drw, colors[i], 3);
+  focus(NULL);
+  arrange(NULL);
+}
+
+void
 zoom(const Arg *arg)
 {
 	Client *c = selmon->sel;
@@ -2154,12 +2378,15 @@ main(int argc, char *argv[])
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("dwm: cannot open display");
 	checkotherwm();
+    XrmInitialize();
+    loadxrdb();
 	setup();
 #ifdef __OpenBSD__
 	if (pledge("stdio rpath proc exec", NULL) == -1)
 		die("pledge");
 #endif /* __OpenBSD__ */
 	scan();
+  restoreSession();
 	run();
 	cleanup();
 	XCloseDisplay(dpy);
