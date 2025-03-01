@@ -97,6 +97,8 @@ static const Key keys[] = {
  	{ MODKEY,                       XK_minus,  setgaps,        {.i = -1 } },
 	{ MODKEY,                       XK_equal,  setgaps,        {.i = +1 } },
 	{ MODKEY|ShiftMask,             XK_equal,  setgaps,        {.i = 0  } },
+  { MODKEY,                       XK_Print,  spawn,          SHCMD("flameshot gui") }, // Open selection tool
+  { MODKEY|ShiftMask,             XK_Print,  spawn,          SHCMD("flameshot full -p ~/Pictures/Screenshots/") }, // Fullscreen
 	// Navigation(two-handed)
 	KEYEVENT(Mod1Mask, XK_h, 0, XK_Left)
 	KEYEVENT(Mod1Mask, XK_l, 0, XK_Right)
